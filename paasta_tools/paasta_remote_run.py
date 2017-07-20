@@ -25,8 +25,11 @@ import string
 import sys
 from datetime import datetime
 
+from boto3.session import Session
 from task_processing.plugins.mesos.mesos_executor import MesosExecutor
 from task_processing.plugins.mesos.retrying_executor import RetryingExecutor
+from task_processing.plugins.persistence.dynamodb_persistence import DynamoDBPersister
+from task_processing.plugins.stateful.stateful_executor import StatefulTaskExecutor
 from task_processing.runners.sync import Sync
 
 from paasta_tools import mesos_tools
@@ -189,11 +192,14 @@ def paasta_to_task_config_kwargs(
 
 
 def build_executor_stack(
-        service,
-        instance,
-        run_id,  # TODO: move run_id into task identifier?
-        system_paasta_config,
-        framework_staging_timeout):
+    service,
+    instance,
+    cluster,
+    run_id,  # TODO: move run_id into task identifier?
+    system_paasta_config,
+    framework_staging_timeout
+):
+
     mesos_address = '{}:{}'.format(
         mesos_tools.get_mesos_leader(), mesos_tools.MESOS_MASTER_PORT
     )
@@ -213,8 +219,27 @@ def build_executor_stack(
         framework_staging_timeout=framework_staging_timeout,
         initial_decline_delay=0.5
     )
+    credentials_file = taskproc_config.get('boto_credential_file')
+    if credentials_file:
+        with open(credentials_file) as f:
+            credentials = json.loads(f.read())
+    else:
+        raise ValueError("Required aws credentials")
+
+    region = taskproc_config.get('aws_region')
+    session = Session(
+        region_name=region,
+        aws_access_key_id=credentials['accessKeyId'],
+        aws_secret_access_key=credentials['secretAccessKey'])
     retrying_executor = RetryingExecutor(mesos_executor)
-    return retrying_executor
+    stateful_executor = StatefulTaskExecutor(
+        downstream_executor=retrying_executor,
+        persister=DynamoDBPersister(
+            table_name="taskproc_events_%s" % cluster,
+            session=session
+        )
+    )
+    return stateful_executor
 
 
 def remote_run_start(args):
@@ -271,11 +296,12 @@ def remote_run_start(args):
     )
 
     executor_stack = build_executor_stack(
-        service,
-        instance,
-        run_id,
-        system_paasta_config,
-        args.staging_timeout
+        service=service,
+        instance=instance,
+        cluster=cluster,
+        run_id=run_id,
+        system_paasta_config=system_paasta_config,
+        framework_staging_timeout=args.staging_timeout
     )
     runner = Sync(executor_stack)
 
